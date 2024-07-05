@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	MaintainInterval  = 100 * time.Millisecond
+	MaintainInterval  = 50 * time.Millisecond
 	SuccessorListSize = 10
 	backupSize        = 3
 )
@@ -151,45 +151,6 @@ func (node *Node) RPCFindCloseSuccessor(addr NodeAddr, reply *NodeAddr) error {
 	return nil
 }
 
-/*
-//递归，返回id的后继节点
-func (node *Node) RPCFindCloseSuccessor(addr NodeAddr, reply *NodeAddr) error {
-	//Q：如果fingerTable[0]下线怎么办
-	node.fingerTableLock.RLock()
-	//此处suc.Id==addr.Id需特判，否则死循环
-	if between(node.addr.Id, node.fingerTable[0].Id, addr.Id) || cmpBigInt(addr.Id, "==", node.fingerTable[0].Id) {
-		if !node.Ping(node.fingerTable[0].Addr) {
-			node.fingerTableLock.RUnlock()
-			//等待fingerTable更新
-			// time.Sleep(50 * time.Millisecond)
-			err := node.RPCFindCloseSuccessor(addr, reply)
-			return err
-		}
-		// if addr.Addr != "" {
-		// logrus.Infof("[end]finish finding(when finding close successor): %s -> %s", addr, node.fingerTable[0])
-		// }
-		(*reply) = NodeAddr{node.fingerTable[0].Addr, getHash(node.fingerTable[0].Addr)}
-		node.fingerTableLock.RUnlock()
-		return nil
-	} else {
-		node.fingerTableLock.RUnlock()
-		var ret, nxt_node NodeAddr
-		node.RPCFindPrecedingFinger(addr, &nxt_node)
-		if cmpBigInt(nxt_node.Id, "==", addr.Id) {
-			*reply = node.addr !error
-			return nil
-		}
-		err := node.RemoteCall(nxt_node.Addr, "Node.RPCFindCloseSuccessor", addr, &ret)
-		if err != nil {
-			*reply = NodeAddr{"", getHash("")}
-			return errors.New("{[error in RPCFindCloseSuccessor with Key = [" + addr.Addr + "], Calling [" + nxt_node.Addr + "], cur_node [" + node.addr.Addr + "]}")
-		}
-		*reply = ret !error
-	}
-	return nil
-}
-*/
-
 func (node *Node) RPCFindClosePredecessor(addr NodeAddr, reply *NodeAddr) error {
 	var suc NodeAddr
 	// 获取当前节点的第一个后继节点
@@ -238,30 +199,30 @@ func (node *Node) RPCFindClosePredecessor(addr NodeAddr, reply *NodeAddr) error 
 }
 
 //把map中的元素加入node.data然后清空map
-func (node *Node) RPCAddData(_ string, giver *(map[string]string)) error {
+func (node *Node) RPCAddData(giver map[string]string, _ *struct{}) error {
 	node.dataLock.Lock()
-	logrus.Infof("[1] Transferring Data to [%s], map size: %d", node.addr.Addr, len(*giver))
-	for key, val := range *giver {
+	logrus.Infof("[1] Transferring Data to [%s], map size: %d", node.addr.Addr, len(giver))
+	for key, val := range giver {
 		logrus.Infof("[1] [%s] with key [%s]", node.addr.Addr, key)
 		node.data[key] = val
 		//todo:备份
 	}
-	*giver = make(map[string]string)
 	node.dataLock.Unlock()
 	return nil
 }
 
 //返回当前在线数据中所有小于等于 preId 的数据，并把数据下线（需要备份？）
 func (node *Node) RPCSplitData(preId *big.Int, receiver *(map[string]string)) error {
-	logrus.Infof("[0] Transfering Data to [%s]", node.addr.Addr)
 	node.dataLock.Lock()
 	for key, val := range node.data {
-		if !(between(getHash(key), node.addr.Id, preId) || cmpBigInt(getHash(key), "==", preId)) {
+		if between(getHash(key), node.addr.Id, preId) || cmpBigInt(getHash(key), "==", preId) {
 			(*receiver)[key] = val
 			delete(node.data, key)
 			//todo:备份
+			// logrus.Infof("[3] Transfering Data to [%s], size:[%d]", node.addr.Addr, len(*receiver))
 		}
 	}
+	logrus.Infof("[3] Transfering Data to [%s], size:[%d]", node.addr.Addr, len(*receiver))
 	node.dataLock.Unlock()
 	return nil
 }
@@ -304,6 +265,7 @@ func (node *Node) RunRPCServer() {
 	node.server.Register(node)
 	var err error
 	node.listener, err = net.Listen("tcp", node.addr.Addr)
+	logrus.Infoln("[Success] Run: ", node.addr.Addr)
 	if err != nil {
 		logrus.Fatal("listen error: ", err)
 	}
@@ -322,7 +284,7 @@ func (node *Node) RemoteCall(addr_str string, method string, args interface{}, r
 	// if method != "Node.RPCPing" {
 	// logrus.Infof("[%s] RemoteCall %s %s %v", node.addr.Addr, addr_str, method, args)
 	// }
-	conn, err := net.DialTimeout("tcp", addr_str, 100*time.Millisecond)
+	conn, err := net.DialTimeout("tcp", addr_str, 150*time.Millisecond)
 	if err != nil {
 		// logrus.Errorf("[dailing] dail timeOut:[%s] RemoteCall %s %s %v, error:[%s] ", node.addr.Addr, addr_str, method, args, err)
 		return err
@@ -403,7 +365,7 @@ func (node *Node) FixFinger() error {
 	pos := addBigInt(node.addr.Id, exp[ptr])
 	err := node.RPCFindCloseSuccessor(NodeAddr{"", pos}, &ret)
 	if err != nil {
-		logrus.Errorf("Error when fixingFinger, cur_node[%s]", node.addr.Addr)
+		// logrus.Errorf("Error when fixingFinger, cur_node[%s]", node.addr.Addr)
 		return err
 	}
 	// 锁定指针表锁，并更新当前指针表的地址和哈希值
@@ -509,6 +471,8 @@ func (node *Node) Join(addr_str string) bool {
 
 	node.dataLock.Lock()
 	err = node.RemoteCall(successor.Addr, "Node.RPCSplitData", node.addr.Id, &node.data)
+	logrus.Infof("[init] Join: cur_node[%s], size [%d]", node.addr, len(node.data))
+
 	node.dataLock.Unlock()
 	if err != nil {
 		logrus.Error("[error] Join and Transfer [", node.addr.Addr, "] ", err)
@@ -565,13 +529,13 @@ func (node *Node) Get(key string) (bool, string) {
 	var suc_node NodeAddr
 	err := node.RPCFindCloseSuccessor(NodeAddr{"", getHash(key)}, &suc_node)
 	if err != nil {
-		logrus.Error("[error] [Put] cannot find successor")
+		logrus.Error("[error] [Get] cannot find successor")
 		return false, ""
 	}
 	var ret_val string
 	err = node.RemoteCall(suc_node.Addr, "Node.RPCGetValue", key, &ret_val)
 	if err != nil {
-		logrus.Error("[error] [Put] error when getting")
+		logrus.Error("[error] [Get] error when getting")
 		return false, ""
 	}
 	return true, ret_val
@@ -607,14 +571,14 @@ func (node *Node) Delete(key string) bool {
 }
 
 func (node *Node) turnOffNode() {
-	node.onlineLock.Lock()
-	node.online = false
 	node.listening = false
-	node.onlineLock.Unlock()
 	err := node.listener.Close()
 	if err != nil {
 		logrus.Errorf("[error] Quit [%s], error:[%s]", node.addr.Addr, err)
 	}
+	node.onlineLock.Lock()
+	node.online = false
+	node.onlineLock.Unlock()
 	logrus.Infof("[Success] Quit: [%s]", node.addr.Addr)
 }
 
@@ -662,7 +626,8 @@ func (node *Node) Quit() {
 
 	node.dataLock.Lock()
 	logrus.Infof("[2] size: %d  node: %s", len(node.data), suc_node.Addr)
-	node.RemoteCall(suc_node.Addr, "Node.RPCAddData", "", &node.data)
+	node.RemoteCall(suc_node.Addr, "Node.RPCAddData", node.data, nil)
+	node.data = make(map[string]string)
 	node.dataLock.Unlock()
 
 	// node.maintainLock.Unlock()
