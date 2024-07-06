@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	MaintainInterval  = 200 * time.Millisecond
+	MaintainInterval  = 250 * time.Millisecond
 	SuccessorListSize = 10
 	backupSize        = 3
 )
@@ -451,7 +451,7 @@ func (node *Node) Maintain() {
 		for node.online {
 			time.Sleep(MaintainInterval)
 			// node.maintainLock.RLock()
-			// node.CheckPredecessor()
+			node.CheckPredecessor()
 			// node.maintainLock.RUnlock()
 		}
 		logrus.Info("[end]CheckPredecessor end: ", node.addr.Addr)
