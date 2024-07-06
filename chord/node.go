@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	MaintainInterval  = 50 * time.Millisecond
+	MaintainInterval  = 200 * time.Millisecond
 	SuccessorListSize = 10
 	backupSize        = 3
 )
@@ -56,9 +56,9 @@ type Node struct {
 	successorListLock sync.RWMutex
 	backup            map[string]string
 	backupLock        sync.RWMutex
-	// maintainLock      sync.RWMutex
+	maintainLock      sync.RWMutex
 	//channel
-	// quit chan struct{}
+	// quit chan bool
 }
 
 func init() {
@@ -69,6 +69,10 @@ func init() {
 
 //在userdef.go/NewNode中被调用，紧跟在node:=new(chord.New)后
 func (node *Node) Init(str_addr string) {
+	node.onlineLock.Lock()
+	node.online = false
+	node.onlineLock.Unlock()
+
 	node.addr = NodeAddr{str_addr, getHash(str_addr)}
 	node.fingerTablePtr = 1
 
@@ -79,6 +83,8 @@ func (node *Node) Init(str_addr string) {
 	node.backupLock.Lock()
 	node.backup = make(map[string]string)
 	node.backupLock.Unlock()
+
+	// node.quit = make(chan bool, 1)
 }
 
 //----来自RPC请求----
@@ -86,8 +92,10 @@ func (node *Node) Init(str_addr string) {
 func (node *Node) RPCPrintInfo(_ string, _ *struct{}) error {
 	if node.online {
 		node.fingerTableLock.RLock()
+		node.predecessorLock.RLock()
 		logrus.Infof("[info] 当前节点：[%s], 前驱：[%s], 后继:[%s]        | [%s]", node.addr.Addr, node.predecessor.Addr, node.fingerTable[0].Addr, node.addr.Id)
 		node.fingerTableLock.RUnlock()
+		node.predecessorLock.RUnlock()
 	} else {
 		logrus.Infof("[info] 当前节点：[%s] is offline", node.addr.Addr)
 	}
@@ -108,14 +116,25 @@ func (node *Node) RPCPing(_ string, _ *struct{}) error {
 	return errors.New("[node closed]")
 }
 
+//强制更新前驱节点
+func (node *Node) RPCChange(addr NodeAddr, _ *struct{}) error {
+	node.predecessorLock.Lock()
+	node.predecessor = NodeAddr{addr.Addr, getHash(addr.Addr)}
+	node.predecessorLock.Unlock()
+	return nil
+}
+
 // 要求更新前驱节点
 func (node *Node) RPCNotify(addr NodeAddr, _ *struct{}) error {
-	if node.predecessor.Addr == "" || between(node.predecessor.Id, node.addr.Id, addr.Id) {
-		logrus.Infof("[Notify] [%s] is notified on [%s]", node.addr.Addr, addr.Addr)
-		node.predecessorLock.Lock()
-		node.predecessor = addr
-		node.predecessorLock.Unlock()
+	node.predecessorLock.RLock()
+	pre := node.predecessor
+	node.predecessorLock.RUnlock()
 
+	if node.predecessor.Addr == "" || between(pre.Id, node.addr.Id, addr.Id) {
+		node.predecessorLock.Lock()
+		node.predecessor = NodeAddr{addr.Addr, getHash(addr.Addr)}
+		logrus.Infof("[5][Notify] [%s] is notified on [%s], new_info [%s|%s]", node.addr.Addr, addr.Addr, node.predecessor.Addr, node.predecessor.Id)
+		node.predecessorLock.Unlock()
 		//todo: 为前驱节点分配数据
 	}
 	return nil
@@ -137,15 +156,15 @@ func (node *Node) RPCFindCloseSuccessor(addr NodeAddr, reply *NodeAddr) error {
 	// logrus.Infof("[RPCFindCloseSuccessor step 1] cur_node[%s], find[%s] ,  %s | ID:%s", node.addr.Addr, tmp_node.Addr, tmp_node.Id, addr.Id)
 	if err != nil {
 		*reply = NodeAddr{"", getHash("")}
-		return errors.New("[error in RPCFindCloseSuccessor]")
-		// return errors.New("{[error in RPCFindCloseSuccessor with Key = [" + addr.Addr + "], Calling [" + nxt_node.Addr + "], cur_node [" + node.addr.Addr + "]}")
+		return errors.New("[error in RPCFindCloseSuccessor][step0]")
+		// return errors.New("{[error in RPCFindCloseSuccessor] with Key = [" + addr.Addr + "], Calling [" + nxt_node.Addr + "], cur_node [" + node.addr.Addr + "]}")
 	}
 
 	err = node.RemoteCall(tmp_node.Addr, "Node.GetFirstSuccessor", "", &suc_node)
 	if err != nil {
 		*reply = NodeAddr{"", getHash("")}
-		return errors.New("[error in RPCFindCloseSuccessor]")
-		// return errors.New("{[error in RPCFindCloseSuccessor with Key = [" + addr.Addr + "], Calling [" + nxt_node.Addr + "], cur_node [" + node.addr.Addr + "]}")
+		return errors.New("[error in RPCFindCloseSuccessor][step1]")
+		// return errors.New("{[error in RPCFindCloseSuccessor] with Key = [" + addr.Addr + "], Calling [" + nxt_node.Addr + "], cur_node [" + node.addr.Addr + "]}")
 	}
 	*reply = NodeAddr{suc_node.Addr, getHash(suc_node.Addr)} //ATTENTION::Id是个指针，应当新建而非复制
 	return nil
@@ -171,6 +190,7 @@ func (node *Node) RPCFindClosePredecessor(addr NodeAddr, reply *NodeAddr) error 
 	node.RPCFindPrecedingFinger(addr, &nxt_node)
 	// logrus.Infof("前驱[%s]", nxt_node)
 	err = node.RemoteCall(nxt_node.Addr, "Node.GetFirstSuccessor", "", &suc)
+	suc.Id = getHash(suc.Addr)
 	if err != nil {
 		*reply = NodeAddr{"", getHash("")}
 		logrus.Errorf("[error] [RPCFindClosePredecessor] cur_node:[%s], node_in_finger:[%s], err_info:%s ", node.addr.Addr, nxt_node.Addr, err)
@@ -183,13 +203,13 @@ func (node *Node) RPCFindClosePredecessor(addr NodeAddr, reply *NodeAddr) error 
 		err = node.RemoteCall(nxt_node.Addr, "Node.RPCFindPrecedingFinger", addr, &nxt_node)
 		if err != nil {
 			*reply = NodeAddr{"", getHash("")}
-			logrus.Errorf("[error] [RPCFindClosePredecessor] 递归中 cur_node:[%s], node_in_finger:[%s], err_info:%s ", nxt_node.Addr, suc.Addr, err)
+			// logrus.Errorf("[error] [RPCFindClosePredecessor] state_0 递归中 cur_node:[%s], node_in_finger:[%s], err_info:%s ", nxt_node.Addr, suc.Addr, err)
 			return err
 		}
 		err = node.RemoteCall(nxt_node.Addr, "Node.GetFirstSuccessor", "", &suc)
 		if err != nil {
 			*reply = NodeAddr{"", getHash("")}
-			logrus.Errorf("[error] [RPCFindClosePredecessor] 递归中 cur_node:[%s], node_in_finger:[%s], err_info:%s ", nxt_node.Addr, suc.Addr, err)
+			// logrus.Errorf("[error] [RPCFindClosePredecessor] state_1 递归中 cur_node:[%s], node_in_finger:[%s], err_info:%s ", nxt_node.Addr, suc.Addr, err)
 			return err
 		}
 	}
@@ -203,7 +223,7 @@ func (node *Node) RPCAddData(giver map[string]string, _ *struct{}) error {
 	node.dataLock.Lock()
 	logrus.Infof("[1] Transferring Data to [%s], map size: %d", node.addr.Addr, len(giver))
 	for key, val := range giver {
-		logrus.Infof("[1] [%s] with key [%s]", node.addr.Addr, key)
+		// logrus.Infof("[1] [%s] with key [%s]", node.addr.Addr, key)
 		node.data[key] = val
 		//todo:备份
 	}
@@ -262,13 +282,18 @@ func (node *Node) RPCFindPrecedingFinger(addr NodeAddr, reply *NodeAddr) error {
 // RunRPCServer
 func (node *Node) RunRPCServer() {
 	node.server = rpc.NewServer()
-	node.server.Register(node)
-	var err error
+	err := node.server.Register(node)
+	if err != nil {
+		logrus.Error("[error] Register error: ", node.addr.Addr, err)
+		return
+	}
 	node.listener, err = net.Listen("tcp", node.addr.Addr)
 	logrus.Infoln("[Success] Run: ", node.addr.Addr)
 	if err != nil {
 		logrus.Fatal("listen error: ", err)
 	}
+	logrus.Info("[Success] Run: ", node.addr.Addr)
+
 	for node.listening {
 		conn, err := node.listener.Accept()
 		if err != nil {
@@ -277,6 +302,26 @@ func (node *Node) RunRPCServer() {
 		}
 		go node.server.ServeConn(conn)
 	}
+	/*go func() {
+		for node.online {
+			select {
+			case <-node.quit:
+				return
+			default:
+				conn, err := node.listener.Accept()
+				if err != nil {
+					logrus.Error("[error] Accept error: ", err)
+					logrus.Info("[end] Run end: ", node.addr.Addr)
+					return
+				}
+				go node.server.ServeConn(conn)
+			}
+		}
+		logrus.Info("[end] Run end: ", node.addr.Addr)
+	}()*/
+	// node.onlineLock.Lock()
+	// node.online = true
+	// node.onlineLock.Unlock()
 }
 
 // Re-connect to the client every time can be slow. You can use connection pool to improve the performance.
@@ -322,6 +367,7 @@ func (node *Node) Stablize() error {
 	var cur_successor, ret NodeAddr
 	node.GetFirstSuccessor("", &cur_successor)
 	err := node.RemoteCall(cur_successor.Addr, "Node.RPCGetPredecessor", "", &ret)
+	ret.Id = getHash(ret.Addr)
 	if err != nil {
 		return err
 	}
@@ -347,13 +393,17 @@ func (node *Node) CheckPredecessor() error {
 	// 检查前驱是否下线
 	node.predecessorLock.RLock()
 	pre := node.predecessor
-	node.predecessorLock.RUnlock()
 	// logrus.Infof("CheckPredecessor, cur_node[%s]", pre.Addr)
-	if pre.Addr != "" && !node.Ping(pre.Addr) {
+
+	if (pre.Addr != "") && (!node.Ping(pre.Addr)) {
+		node.predecessorLock.RUnlock()
 		node.predecessorLock.Lock()
+		logrus.Infof("[5] set empty, cur_node[%s], pre[%s] state:[%b]", node.addr.Addr, pre.Addr, node.Ping(pre.Addr))
 		node.predecessor = NodeAddr{"", getHash("")}
 		node.predecessorLock.Unlock()
 		// todo:备份数据
+	} else {
+		node.predecessorLock.RUnlock()
 	}
 	return nil
 }
@@ -387,19 +437,21 @@ func (node *Node) FixFinger() error {
 //创建维护线程
 func (node *Node) Maintain() {
 	go func() {
+		node.maintainLock.RLock()
 		for node.online {
-			time.Sleep(MaintainInterval)
-			// node.maintainLock.RLock()
 			node.Stablize()
-			// node.maintainLock.RUnlock()
+			node.maintainLock.RUnlock()
+			time.Sleep(MaintainInterval)
+			node.maintainLock.RLock()
 		}
+		node.maintainLock.RUnlock()
 		logrus.Info("[end]Stablize end: ", node.addr.Addr)
 	}()
 	go func() {
 		for node.online {
 			time.Sleep(MaintainInterval)
 			// node.maintainLock.RLock()
-			node.CheckPredecessor()
+			// node.CheckPredecessor()
 			// node.maintainLock.RUnlock()
 		}
 		logrus.Info("[end]CheckPredecessor end: ", node.addr.Addr)
@@ -407,9 +459,7 @@ func (node *Node) Maintain() {
 	go func() {
 		for node.online {
 			time.Sleep(MaintainInterval)
-			// node.maintainLock.RLock()
 			node.FixFinger()
-			// node.maintainLock.RUnlock()
 		}
 		logrus.Info("[end]FixFinger end: ", node.addr.Addr)
 	}()
@@ -420,7 +470,7 @@ func (node *Node) Create() {
 	logrus.Info("创建")
 
 	node.predecessorLock.Lock()
-	node.predecessor = node.addr
+	node.predecessor = NodeAddr{node.addr.Addr, getHash(node.addr.Addr)}
 	node.predecessorLock.Unlock()
 	node.fingerTableLock.Lock()
 
@@ -602,8 +652,9 @@ func (node *Node) Quit() {
 	if !node.online {
 		return
 	}
+	// node.quit <- true
 	node.online = false
-	// node.maintainLock.Lock()
+	node.maintainLock.Lock()
 
 	//todo UsualQuit
 	var update_node, suc_node NodeAddr
@@ -630,13 +681,20 @@ func (node *Node) Quit() {
 	node.data = make(map[string]string)
 	node.dataLock.Unlock()
 
-	// node.maintainLock.Unlock()
+	node.predecessorLock.RLock()
+	node.RemoteCall(suc_node.Addr, "Node.RPCChange", node.predecessor, nil)
+	node.predecessorLock.RUnlock()
+
 	node.turnOffNode()
+	node.maintainLock.Unlock()
+	// node.quit = make(chan bool, 1)
 	logrus.Infof("[success]退出成功 %s", node.addr.Addr)
 }
 
 // 强制退出网络，直接停止 RPC 服务器。
 func (node *Node) ForceQuit() {
 	logrus.Info("强制退出")
+	// node.quit <- true
 	node.turnOffNode()
+	// node.quit = make(chan bool, 1)
 }
