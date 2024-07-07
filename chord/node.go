@@ -57,8 +57,6 @@ type Node struct {
 	backup            map[string]string
 	backupLock        sync.RWMutex
 	maintainLock      sync.RWMutex
-	//channel
-	// quit chan bool
 }
 
 func init() {
@@ -83,8 +81,6 @@ func (node *Node) Init(str_addr string) {
 	node.backupLock.Lock()
 	node.backup = make(map[string]string)
 	node.backupLock.Unlock()
-
-	// node.quit = make(chan bool, 1)
 }
 
 //----来自RPC请求----
@@ -258,9 +254,15 @@ func (node *Node) PutNewData(data DataPair, _ *struct{}) error {
 }
 
 func (node *Node) GetFirstSuccessor(_ string, ret *NodeAddr) error {
-	//待完善，不考虑forceQuit
 	node.fingerTableLock.RLock()
 	*ret = NodeAddr{node.fingerTable[0].Addr, getHash(node.fingerTable[0].Addr)}
+	for i := 0; i < successorSize; i++ {
+		if node.Ping(node.successorList[i].Addr) {
+			*ret = NodeAddr{node.successorList[i].Addr, getHash(node.successorList[i].Addr)}
+			node.fingerTableLock.RUnlock()
+			return nil
+		}
+	}
 	node.fingerTableLock.RUnlock()
 	return nil
 }
@@ -302,26 +304,6 @@ func (node *Node) RunRPCServer() {
 		}
 		go node.server.ServeConn(conn)
 	}
-	/*go func() {
-		for node.online {
-			select {
-			case <-node.quit:
-				return
-			default:
-				conn, err := node.listener.Accept()
-				if err != nil {
-					logrus.Error("[error] Accept error: ", err)
-					logrus.Info("[end] Run end: ", node.addr.Addr)
-					return
-				}
-				go node.server.ServeConn(conn)
-			}
-		}
-		logrus.Info("[end] Run end: ", node.addr.Addr)
-	}()*/
-	// node.onlineLock.Lock()
-	// node.online = true
-	// node.onlineLock.Unlock()
 }
 
 // Re-connect to the client every time can be slow. You can use connection pool to improve the performance.
@@ -385,6 +367,9 @@ func (node *Node) Stablize() error {
 	if err != nil {
 		return err
 	}
+
+	//修复successor list
+
 	return nil
 }
 
@@ -652,7 +637,6 @@ func (node *Node) Quit() {
 	if !node.online {
 		return
 	}
-	// node.quit <- true
 	node.online = false
 	node.maintainLock.Lock()
 
@@ -666,7 +650,6 @@ func (node *Node) Quit() {
 			logrus.Errorf("[error] [Quit] when updating fingerTable")
 		}
 		if i == 0 {
-			// logrus.Infof("[%s] [%s]", pos, node.addr.Id)
 			logrus.Infof("[更新] Update[%s] Pre[%s] New[%s]", update_node.Addr, node.addr.Addr, suc_node.Addr)
 		}
 		err = node.RemoteCall(update_node.Addr, "Node.RPCNotifyFinger", NotifyFingerInfo{PreNode: node.addr, NewNode: suc_node, Pos: i}, nil)
@@ -687,14 +670,11 @@ func (node *Node) Quit() {
 
 	node.turnOffNode()
 	node.maintainLock.Unlock()
-	// node.quit = make(chan bool, 1)
 	logrus.Infof("[success]退出成功 %s", node.addr.Addr)
 }
 
 // 强制退出网络，直接停止 RPC 服务器。
 func (node *Node) ForceQuit() {
 	logrus.Info("强制退出")
-	// node.quit <- true
 	node.turnOffNode()
-	// node.quit = make(chan bool, 1)
 }
