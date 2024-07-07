@@ -58,6 +58,9 @@ type Node struct {
 	backupLock        sync.RWMutex
 	//maintainLock
 	maintainLock sync.RWMutex
+	//复用
+	mu   sync.Mutex
+	pool map[string]*rpc.Client
 }
 
 func init() {
@@ -82,6 +85,10 @@ func (node *Node) Init(str_addr string) {
 	node.backupLock.Lock()
 	node.backup = make(map[string]string)
 	node.backupLock.Unlock()
+
+	node.mu.Lock()
+	node.pool = make(map[string]*rpc.Client)
+	node.mu.Unlock()
 }
 
 //----来自RPC请求----
@@ -317,10 +324,6 @@ func (node *Node) CombineBackUp(data map[string]string, _ *struct{}) error {
 }
 
 func (node *Node) GetFirstSuccessor(_ string, ret *NodeAddr) error {
-	// node.fingerTableLock.RLock()
-	// *ret = NodeAddr{node.fingerTable[0].Addr, getHash(node.fingerTable[0].Addr)}
-	// node.fingerTableLock.RUnlock()
-
 	node.successorListLock.RLock()
 	for i := 0; i < listSize; i++ {
 		if node.Ping(node.successorList[i].Addr) {
@@ -330,7 +333,9 @@ func (node *Node) GetFirstSuccessor(_ string, ret *NodeAddr) error {
 		}
 	}
 	node.successorListLock.RUnlock()
-
+	//if not find
+	// node.RPCFindCloseSuccessor(node.addr, ret)
+	// node.successorList[0] = NodeAddr{(*ret).Addr, getHash((*ret).Addr)}
 	return nil
 }
 func (node *Node) RPCFindPrecedingFinger(addr NodeAddr, reply *NodeAddr) error {
@@ -357,6 +362,29 @@ func (node *Node) RunRPCServer() {
 		return
 	}
 	node.listener, err = net.Listen("tcp", node.addr.Addr)
+	if err != nil {
+		logrus.Fatal("listen error: ", err)
+	}
+	logrus.Infoln("[Success] Run: ", node.addr.Addr)
+
+	for node.listening {
+		conn, err := node.listener.Accept()
+		if err != nil {
+			logrus.Error("accept error: ", err)
+			return
+		}
+		go node.server.ServeConn(conn)
+	}
+}
+
+/*func (node *Node) RunRPCServer() {
+	node.server = rpc.NewServer()
+	err := node.server.Register(node)
+	if err != nil {
+		logrus.Error("[error] Register error: ", node.addr.Addr, err)
+		return
+	}
+	node.listener, err = net.Listen("tcp", node.addr.Addr)
 	logrus.Infoln("[Success] Run: ", node.addr.Addr)
 	if err != nil {
 		logrus.Fatal("listen error: ", err)
@@ -371,10 +399,45 @@ func (node *Node) RunRPCServer() {
 		}
 		go node.server.ServeConn(conn)
 	}
+}*/
+
+// RemoteCall 远程调用
+func (node *Node) RemoteCall(addrStr string, method string, args interface{}, reply interface{}) error {
+	node.mu.Lock()
+	client, ok := node.pool[addrStr]
+	node.mu.Unlock()
+
+	if !ok {
+		var err error
+		client, err = node.dial(addrStr)
+		if err != nil {
+			return err
+		}
+		node.mu.Lock()
+		node.pool[addrStr] = client
+		node.mu.Unlock()
+	}
+
+	err := client.Call(method, args, reply)
+	if err != nil {
+		logrus.Warnf("[RemoteCall] [%s] when [%s] Call [%s] [%s] [%v] ", err, node.addr.Addr, addrStr, method, args)
+		node.mu.Lock()
+		delete(node.pool, addrStr)
+		node.mu.Unlock()
+		client.Close()
+	}
+	return err
+}
+func (node *Node) dial(addrStr string) (*rpc.Client, error) {
+	conn, err := net.DialTimeout("tcp", addrStr, 150*time.Millisecond)
+	if err != nil {
+		return nil, err
+	}
+	client := rpc.NewClient(conn)
+	return client, nil
 }
 
-// Re-connect to the client every time can be slow. You can use connection pool to improve the performance.
-func (node *Node) RemoteCall(addr_str string, method string, args interface{}, reply interface{}) error {
+/*func (node *Node) RemoteCall(addr_str string, method string, args interface{}, reply interface{}) error {
 	// if method != "Node.RPCPing" {
 	// logrus.Infof("[%s] RemoteCall %s %s %v", node.addr.Addr, addr_str, method, args)
 	// }
@@ -392,6 +455,7 @@ func (node *Node) RemoteCall(addr_str string, method string, args interface{}, r
 	}
 	return nil
 }
+*/
 func (node *Node) Ping(addr_str string) bool {
 	if addr_str == node.addr.Addr {
 		return node.online
