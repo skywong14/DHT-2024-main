@@ -12,6 +12,10 @@ const m int = 160 // m <= 160
 var exp [161]*big.Int
 
 func cmpBigInt(int1 *big.Int, symble string, int2 *big.Int) bool {
+	if int1 == nil || int2 == nil {
+		logrus.Errorf("[tmp]check between: %s | %s", int1.String(), int2.String())
+		return true
+	}
 	flag := int1.Cmp(int2)
 	switch symble {
 	case "<":
@@ -46,6 +50,7 @@ func initExp() {
 func between(ll, rr, val *big.Int) bool {
 	if ll == nil || rr == nil || val == nil {
 		logrus.Errorf("[tmp]check between: %s | %s | %s", ll.String(), rr.String(), val.String())
+		return true
 	}
 	if cmpBigInt(rr, "<=", ll) {
 		return cmpBigInt(val, "<", rr) || cmpBigInt(val, ">", ll)

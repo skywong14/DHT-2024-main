@@ -14,9 +14,9 @@ import (
 )
 
 const (
-	MaintainInterval  = 250 * time.Millisecond
-	SuccessorListSize = 10
-	backupSize        = 3
+	MaintainInterval = 500 * time.Millisecond
+	listSize         = 10
+	//backUpSize = 1
 )
 
 type NodeAddr struct {
@@ -52,11 +52,12 @@ type Node struct {
 	listener net.Listener
 	server   *rpc.Server
 	//backup and successorList
-	successorList     [SuccessorListSize]NodeAddr
+	successorList     [listSize]NodeAddr
 	successorListLock sync.RWMutex
 	backup            map[string]string
 	backupLock        sync.RWMutex
-	maintainLock      sync.RWMutex
+	//maintainLock
+	maintainLock sync.RWMutex
 }
 
 func init() {
@@ -87,10 +88,10 @@ func (node *Node) Init(str_addr string) {
 //for debug
 func (node *Node) RPCPrintInfo(_ string, _ *struct{}) error {
 	if node.online {
-		node.fingerTableLock.RLock()
+		var tmpnode NodeAddr
 		node.predecessorLock.RLock()
-		logrus.Infof("[info] 当前节点：[%s], 前驱：[%s], 后继:[%s]        | [%s]", node.addr.Addr, node.predecessor.Addr, node.fingerTable[0].Addr, node.addr.Id)
-		node.fingerTableLock.RUnlock()
+		node.GetFirstSuccessor("", &tmpnode)
+		logrus.Infof("[info] 当前节点：[%s], 前驱：[%s], 后继:[%s]        | [%s]", node.addr.Addr, node.predecessor.Addr, tmpnode.Addr, node.addr.Id)
 		node.predecessorLock.RUnlock()
 	} else {
 		logrus.Infof("[info] 当前节点：[%s] is offline", node.addr.Addr)
@@ -119,6 +120,15 @@ func (node *Node) RPCChange(addr NodeAddr, _ *struct{}) error {
 	node.predecessorLock.Unlock()
 	return nil
 }
+func (node *Node) CopyBackup(addr string, backup *(map[string]string)) error {
+	*backup = make(map[string]string)
+	node.dataLock.RLock()
+	for key, val := range node.data {
+		(*backup)[key] = val
+	}
+	node.dataLock.RUnlock()
+	return nil
+}
 
 // 要求更新前驱节点
 func (node *Node) RPCNotify(addr NodeAddr, _ *struct{}) error {
@@ -129,9 +139,16 @@ func (node *Node) RPCNotify(addr NodeAddr, _ *struct{}) error {
 	if node.predecessor.Addr == "" || between(pre.Id, node.addr.Id, addr.Id) {
 		node.predecessorLock.Lock()
 		node.predecessor = NodeAddr{addr.Addr, getHash(addr.Addr)}
-		logrus.Infof("[5][Notify] [%s] is notified on [%s], new_info [%s|%s]", node.addr.Addr, addr.Addr, node.predecessor.Addr, node.predecessor.Id)
+		logrus.Infof("[Notify] [%s] is notified on [%s], new_info [%s|%s]", node.addr.Addr, addr.Addr, node.predecessor.Addr, node.predecessor.Id)
 		node.predecessorLock.Unlock()
-		//todo: 为前驱节点分配数据
+		//更新backup
+		node.backupLock.Lock()
+		err := node.RemoteCall(addr.Addr, "Node.CopyBackup", node.addr.Addr, &node.backup)
+		node.backupLock.Unlock()
+		if err != nil {
+			logrus.Errorf("[Notify] error of CopyBackup, pre:[%s] error[%s]", addr.Addr, err)
+			return err
+		}
 	}
 	return nil
 }
@@ -175,6 +192,7 @@ func (node *Node) RPCFindClosePredecessor(addr NodeAddr, reply *NodeAddr) error 
 	}
 	// 检查目标地址的HashId是否在当前节点和其后继节点之间
 	// 如果在范围内，则当前节点即为Predecessor
+	// logrus.Infof("[RPCFindClosePredecessor]  cur_node:[%s], nxt_node:[%s] ", node.addr.Addr, suc.Addr)
 	if between(node.addr.Id, suc.Id, addr.Id) || cmpBigInt(suc.Id, "==", addr.Id) {
 		*reply = NodeAddr{node.addr.Addr, getHash(node.addr.Addr)}
 		// logrus.Infof("[1] [%s]<[%s]<=[%s]", node.addr.Addr, "...", suc.Addr)
@@ -184,7 +202,6 @@ func (node *Node) RPCFindClosePredecessor(addr NodeAddr, reply *NodeAddr) error 
 	var nxt_node NodeAddr
 	// 在fingerTable查找最近的前继
 	node.RPCFindPrecedingFinger(addr, &nxt_node)
-	// logrus.Infof("前驱[%s]", nxt_node)
 	err = node.RemoteCall(nxt_node.Addr, "Node.GetFirstSuccessor", "", &suc)
 	suc.Id = getHash(suc.Addr)
 	if err != nil {
@@ -227,43 +244,93 @@ func (node *Node) RPCAddData(giver map[string]string, _ *struct{}) error {
 	return nil
 }
 
-//返回当前在线数据中所有小于等于 preId 的数据，并把数据下线（需要备份？）
-func (node *Node) RPCSplitData(preId *big.Int, receiver *(map[string]string)) error {
+//返回当前在线数据中所有小于等于 preId 的数据，并把数据下线
+//下线的数据加入backup，同时在suc的backup中删除
+func (node *Node) RPCSplitData(pre NodeAddr, receiver *(map[string]string)) error {
 	node.dataLock.Lock()
+	node.backupLock.Lock()
+	node.backup = make(map[string]string)
 	for key, val := range node.data {
-		if between(getHash(key), node.addr.Id, preId) || cmpBigInt(getHash(key), "==", preId) {
+		if between(getHash(key), node.addr.Id, pre.Id) || cmpBigInt(getHash(key), "==", pre.Id) {
 			(*receiver)[key] = val
 			delete(node.data, key)
-			//todo:备份
-			// logrus.Infof("[3] Transfering Data to [%s], size:[%d]", node.addr.Addr, len(*receiver))
+			node.backup[key] = val
+			// logrus.Infof("Transfering Data to [%s], size:[%d]", node.addr.Addr, len(*receiver))
 		}
 	}
-	logrus.Infof("[3] Transfering Data to [%s], size:[%d]", node.addr.Addr, len(*receiver))
 	node.dataLock.Unlock()
+	node.backupLock.Unlock()
+	var suc_node NodeAddr
+	node.GetFirstSuccessor("", &suc_node)
+	// if (suc_node.Addr != node.addr.Addr)
+	node.RemoteCall(suc_node.Addr, "Node.DelBackUp", node.backup, nil)
+
+	logrus.Infof("Transfering Data to [%s], size:[%d]", node.addr.Addr, len(*receiver))
+
+	node.predecessorLock.Lock()
+	node.predecessor = NodeAddr{pre.Addr, getHash(pre.Addr)}
+	node.predecessorLock.Unlock()
+	return nil
+}
+func (node *Node) DelBackUp(data map[string]string, _ *struct{}) error {
+	node.backupLock.Lock()
+	for key := range data {
+		_, flag := node.backup[key]
+		if flag {
+			delete(node.backup, key)
+		}
+	}
+	node.backupLock.Unlock()
 	return nil
 }
 
 //----自身相关----
+func (node *Node) GetSuccessorList(_ string, reply *[listSize]NodeAddr) error {
+	node.successorListLock.RLock()
+	*reply = node.successorList
+	node.successorListLock.RUnlock()
+	return nil
+}
+
 func (node *Node) PutNewData(data DataPair, _ *struct{}) error {
-	logrus.Infof("[Put] at [%s]", node.addr.Addr)
+	logrus.Infof("[Put][Data] at [%s]", node.addr.Addr)
 	node.dataLock.Lock()
 	defer node.dataLock.Unlock()
 	node.data[data.Key] = data.Value
-	logrus.Infof("[Put] Finish at [%s]", node.addr.Addr)
+	return nil
+}
+func (node *Node) PutNewBackUp(data DataPair, _ *struct{}) error {
+	logrus.Infof("[Put][Backup] at [%s]", node.addr.Addr)
+	node.dataLock.Lock()
+	defer node.dataLock.Unlock()
+	node.backup[data.Key] = data.Value
+	return nil
+}
+func (node *Node) CombineBackUp(data map[string]string, _ *struct{}) error {
+	logrus.Infof("[Combine Backup] at [%s]", node.addr.Addr)
+	node.backupLock.Lock()
+	defer node.backupLock.Unlock()
+	for key, val := range data {
+		node.backup[key] = val
+	}
 	return nil
 }
 
 func (node *Node) GetFirstSuccessor(_ string, ret *NodeAddr) error {
-	node.fingerTableLock.RLock()
-	*ret = NodeAddr{node.fingerTable[0].Addr, getHash(node.fingerTable[0].Addr)}
-	for i := 0; i < successorSize; i++ {
+	// node.fingerTableLock.RLock()
+	// *ret = NodeAddr{node.fingerTable[0].Addr, getHash(node.fingerTable[0].Addr)}
+	// node.fingerTableLock.RUnlock()
+
+	node.successorListLock.RLock()
+	for i := 0; i < listSize; i++ {
 		if node.Ping(node.successorList[i].Addr) {
 			*ret = NodeAddr{node.successorList[i].Addr, getHash(node.successorList[i].Addr)}
-			node.fingerTableLock.RUnlock()
+			node.successorListLock.RUnlock()
 			return nil
 		}
 	}
-	node.fingerTableLock.RUnlock()
+	node.successorListLock.RUnlock()
+
 	return nil
 }
 func (node *Node) RPCFindPrecedingFinger(addr NodeAddr, reply *NodeAddr) error {
@@ -320,7 +387,7 @@ func (node *Node) RemoteCall(addr_str string, method string, args interface{}, r
 	defer client.Close()
 	err = client.Call(method, args, reply)
 	if err != nil {
-		logrus.Errorf("RemoteCall error:[%s] when [%s] RemoteCall %s %s %v ", err, node.addr.Addr, addr_str, method, args)
+		logrus.Warnf("[RemoteCall] [%s] when [%s] Call [%s] [%s] [%v] ", err, node.addr.Addr, addr_str, method, args)
 		return err
 	}
 	return nil
@@ -335,6 +402,22 @@ func (node *Node) Ping(addr_str string) bool {
 	} else {
 		return true
 	}
+}
+
+func (node *Node) UpdateSuccessorList(cur_successor NodeAddr) error {
+	var suclist [listSize]NodeAddr
+	err := node.RemoteCall(cur_successor.Addr, "Node.GetSuccessorList", "", &suclist)
+	if err != nil {
+		logrus.Errorf("[error] UpdateSuccessorList when getSuccessorList, cur_node:[%s]", node.addr.Addr)
+		return err
+	}
+	node.successorListLock.Lock()
+	node.successorList[0] = NodeAddr{cur_successor.Addr, getHash(cur_successor.Addr)}
+	for i := 1; i < listSize; i++ {
+		node.successorList[i] = NodeAddr{suclist[i-1].Addr, getHash(suclist[i-1].Addr)}
+	}
+	node.successorListLock.Unlock()
+	return nil
 }
 
 // 启动节点
@@ -353,7 +436,6 @@ func (node *Node) Stablize() error {
 	if err != nil {
 		return err
 	}
-
 	if ret.Addr != "" && between(node.addr.Id, cur_successor.Id, ret.Id) && node.Ping(ret.Addr) {
 		cur_successor = ret
 	}
@@ -365,11 +447,12 @@ func (node *Node) Stablize() error {
 	//Notify
 	err = node.RemoteCall(cur_successor.Addr, "Node.RPCNotify", node.addr, nil)
 	if err != nil {
+		logrus.Errorf("[Notify] cur_node[%s] suc_node[%s],error: %s", node.addr.Addr, cur_successor.Addr, err)
 		return err
 	}
 
 	//修复successor list
-
+	node.UpdateSuccessorList(cur_successor)
 	return nil
 }
 
@@ -383,10 +466,27 @@ func (node *Node) CheckPredecessor() error {
 	if (pre.Addr != "") && (!node.Ping(pre.Addr)) {
 		node.predecessorLock.RUnlock()
 		node.predecessorLock.Lock()
-		logrus.Infof("[5] set empty, cur_node[%s], pre[%s] state:[%b]", node.addr.Addr, pre.Addr, node.Ping(pre.Addr))
+		logrus.Infof("[CheckPredecessor] set empty, cur_node[%s], pre[%s] state:[%b]", node.addr.Addr, pre.Addr, node.Ping(pre.Addr))
 		node.predecessor = NodeAddr{"", getHash("")}
 		node.predecessorLock.Unlock()
-		// todo:备份数据
+		// 备份数据
+		node.backupLock.Lock()
+		node.dataLock.Lock()
+
+		// 备份数据移回主数据，并清空
+		//ATTENTION可能重复
+		for k, v := range node.backup {
+			node.data[k] = v
+		}
+		var suc_node NodeAddr
+		node.GetFirstSuccessor("", &suc_node)
+		if suc_node.Addr != node.addr.Addr {
+			node.RemoteCall(suc_node.Addr, "Node.CombineBackUp", node.backup, nil)
+		}
+		node.backup = make(map[string]string)
+		node.dataLock.Unlock()
+		node.backupLock.Unlock()
+
 	} else {
 		node.predecessorLock.RUnlock()
 	}
@@ -505,7 +605,7 @@ func (node *Node) Join(addr_str string) bool {
 	node.fingerTableLock.Unlock()
 
 	node.dataLock.Lock()
-	err = node.RemoteCall(successor.Addr, "Node.RPCSplitData", node.addr.Id, &node.data)
+	err = node.RemoteCall(successor.Addr, "Node.RPCSplitData", node.addr, &node.data)
 	logrus.Infof("[init] Join: cur_node[%s], size [%d]", node.addr, len(node.data))
 
 	node.dataLock.Unlock()
@@ -513,6 +613,8 @@ func (node *Node) Join(addr_str string) bool {
 		logrus.Error("[error] Join and Transfer [", node.addr.Addr, "] ", err)
 		return false
 	}
+
+	node.UpdateSuccessorList(successor)
 
 	//todo:back up
 
@@ -523,8 +625,8 @@ func (node *Node) Join(addr_str string) bool {
 // 在当前节点存储一个新的键值对，并广播给所有对等节点。
 func (node *Node) Put(key string, value string) bool {
 	logrus.Infof("存储 %s %s", key, value)
-	// 通过RPC查找key的后继节点
-	var suc_node NodeAddr
+	// 查找key的后继节点
+	var suc_node, suc_suc_node NodeAddr
 	err := node.RPCFindCloseSuccessor(NodeAddr{"", getHash(key)}, &suc_node)
 	if err != nil {
 		logrus.Error("[error] cannot find successor in Put")
@@ -536,8 +638,16 @@ func (node *Node) Put(key string, value string) bool {
 		logrus.Errorf("[error] PutNewData in [%s]", suc_node.Addr)
 		return false
 	}
-
-	// todo 获取存放备份的后继节点
+	// 存放备份
+	err = node.RemoteCall(suc_node.Addr, "Node.GetFirstSuccessor", "", &suc_suc_node)
+	if err != nil {
+		logrus.Error("[error] [Put] update backup:", err)
+	} else {
+		err = node.RemoteCall(suc_suc_node.Addr, "Node.PutNewBackUp", DataPair{key, value}, nil)
+		if err != nil {
+			logrus.Error("[error] [Put] update backup:", err)
+		}
+	}
 	// todo 备份数据
 
 	logrus.Infof("[Success] Put: [%s] <-- (%s , %s) ", suc_node.Addr, key, value)
@@ -587,11 +697,22 @@ func (node *Node) RPCDeleteValue(key string, _ *struct{}) error {
 		return fmt.Errorf("[error] DeleteValue when [%s] with key [%s]", node.addr.Addr, key)
 	}
 }
+func (node *Node) RPCDeleteValueBackUp(key string, _ *struct{}) error {
+	node.backupLock.RLock()
+	defer node.backupLock.RUnlock()
+	_, flag := node.backup[key]
+	if flag {
+		delete(node.backup, key)
+		return nil
+	} else {
+		return fmt.Errorf("[error] DeleteValueBackUp when [%s] with key [%s]", node.addr.Addr, key)
+	}
+}
 
 // 从当前节点删除一个键值对，并广播给所有对等节点。
 func (node *Node) Delete(key string) bool {
 	logrus.Infof("删除 %s", key)
-	var suc_node NodeAddr
+	var suc_node, suc_suc_node NodeAddr
 	err := node.RPCFindCloseSuccessor(NodeAddr{"", getHash(key)}, &suc_node)
 	if err != nil {
 		logrus.Error("[error] [Delete] cannot find successor")
@@ -601,6 +722,16 @@ func (node *Node) Delete(key string) bool {
 	if err != nil {
 		logrus.Error("[error] [Delete] error when deleting")
 		return false
+	}
+
+	err = node.RemoteCall(suc_node.Addr, "Node.GetFirstSuccessor", "", &suc_suc_node)
+	if err != nil {
+		logrus.Error("[Delete] when back_up:", err)
+	} else {
+		err = node.RemoteCall(suc_suc_node.Addr, "Node.RPCDeleteValueBackUp", key, nil)
+		if err != nil {
+			logrus.Error("[Delete] when back_up:", err)
+		}
 	}
 	return true
 }
@@ -675,6 +806,6 @@ func (node *Node) Quit() {
 
 // 强制退出网络，直接停止 RPC 服务器。
 func (node *Node) ForceQuit() {
-	logrus.Info("强制退出")
+	logrus.Infof("%s 强制退出", node.addr.Addr)
 	node.turnOffNode()
 }
