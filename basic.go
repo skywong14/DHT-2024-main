@@ -67,7 +67,7 @@ func basicTest() (bool, int, int) {
 
 		time.Sleep(basicTestAfterJoinQuitSleepTime)
 		nodes[0].AddInfo("Join执行完毕 (round " + string(t) + ")")
-		for j := 0; j <= basicTestRoundJoinNodeSize*4; j++ {
+		for j := 0; j <= basicTestRoundJoinNodeSize*2; j++ {
 			nodes[j].Debug()
 		}
 		/* Put, part 1. */

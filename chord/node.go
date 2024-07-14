@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	MaintainInterval = 500 * time.Millisecond
+	MaintainInterval = 400 * time.Millisecond
 	listSize         = 10
 	//backUpSize = 1
 )
@@ -333,9 +333,6 @@ func (node *Node) GetFirstSuccessor(_ string, ret *NodeAddr) error {
 		}
 	}
 	node.successorListLock.RUnlock()
-	//if not find
-	// node.RPCFindCloseSuccessor(node.addr, ret)
-	// node.successorList[0] = NodeAddr{(*ret).Addr, getHash((*ret).Addr)}
 	return nil
 }
 func (node *Node) RPCFindPrecedingFinger(addr NodeAddr, reply *NodeAddr) error {
@@ -377,30 +374,6 @@ func (node *Node) RunRPCServer() {
 	}
 }
 
-/*func (node *Node) RunRPCServer() {
-	node.server = rpc.NewServer()
-	err := node.server.Register(node)
-	if err != nil {
-		logrus.Error("[error] Register error: ", node.addr.Addr, err)
-		return
-	}
-	node.listener, err = net.Listen("tcp", node.addr.Addr)
-	logrus.Infoln("[Success] Run: ", node.addr.Addr)
-	if err != nil {
-		logrus.Fatal("listen error: ", err)
-	}
-	logrus.Info("[Success] Run: ", node.addr.Addr)
-
-	for node.listening {
-		conn, err := node.listener.Accept()
-		if err != nil {
-			logrus.Error("accept error: ", err)
-			return
-		}
-		go node.server.ServeConn(conn)
-	}
-}*/
-
 // RemoteCall 远程调用
 func (node *Node) RemoteCall(addrStr string, method string, args interface{}, reply interface{}) error {
 	node.mu.Lock()
@@ -437,25 +410,6 @@ func (node *Node) dial(addrStr string) (*rpc.Client, error) {
 	return client, nil
 }
 
-/*func (node *Node) RemoteCall(addr_str string, method string, args interface{}, reply interface{}) error {
-	// if method != "Node.RPCPing" {
-	// logrus.Infof("[%s] RemoteCall %s %s %v", node.addr.Addr, addr_str, method, args)
-	// }
-	conn, err := net.DialTimeout("tcp", addr_str, 150*time.Millisecond)
-	if err != nil {
-		// logrus.Errorf("[dailing] dail timeOut:[%s] RemoteCall %s %s %v, error:[%s] ", node.addr.Addr, addr_str, method, args, err)
-		return err
-	}
-	client := rpc.NewClient(conn)
-	defer client.Close()
-	err = client.Call(method, args, reply)
-	if err != nil {
-		logrus.Warnf("[RemoteCall] [%s] when [%s] Call [%s] [%s] [%v] ", err, node.addr.Addr, addr_str, method, args)
-		return err
-	}
-	return nil
-}
-*/
 func (node *Node) Ping(addr_str string) bool {
 	if addr_str == node.addr.Addr {
 		return node.online
@@ -679,8 +633,6 @@ func (node *Node) Join(addr_str string) bool {
 	}
 
 	node.UpdateSuccessorList(successor)
-
-	//todo:back up
 
 	node.Maintain()
 	return true
