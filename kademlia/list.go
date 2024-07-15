@@ -7,37 +7,71 @@ import (
 	"sync"
 )
 
-type kList struct {
-	mu       sync.RWMutex
-	l        *list.List
-	cur_node string
+type KListSlice struct {
+	Elements []string
+	CurNode  string
 }
 
-func NewListPtr(addr_str string) *kList {
-	return &kList{
-		l:        list.New(),
-		cur_node: addr_str,
+func FromKListSlice(slice KListSlice) KList {
+	l := KList{
+		L:       list.New(),
+		CurNode: slice.CurNode,
 	}
-}
-func NewList(addr_str string) kList {
-	return kList{
-		l:        list.New(),
-		cur_node: addr_str,
+
+	for _, elem := range slice.Elements {
+		l.L.PushBack(elem)
 	}
+
+	return l
 }
-func (l *kList) Init(addr_str string) {
-	l.mu.Lock()
-	l.l = list.New()
-	l.cur_node = addr_str
-	l.mu.Unlock()
+func (l *KList) ToKListSlice() KListSlice {
+	l.Mu.Lock()
+	defer l.Mu.Unlock()
+	elements := make([]string, 0, l.L.Len())
+	for e := l.L.Front(); e != nil; e = e.Next() {
+		if val, ok := e.Value.(string); ok {
+			elements = append(elements, val)
+		}
+	}
+	return KListSlice{
+		Elements: elements,
+		CurNode:  l.CurNode,
+	}
 }
 
-func (l *kList) Print() string {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+type KList struct {
+	L       *list.List
+	CurNode string
+	Mu      sync.RWMutex
+}
+
+func NewListPtr(addrStr string) *KList {
+	return &KList{
+		L:       list.New(),
+		CurNode: addrStr,
+	}
+}
+
+func NewList(addrStr string) KList {
+	return KList{
+		L:       list.New(),
+		CurNode: addrStr,
+	}
+}
+
+func (l *KList) Init(addrStr string) {
+	l.Mu.Lock()
+	defer l.Mu.Unlock()
+	l.L = list.New()
+	l.CurNode = addrStr
+}
+
+func (l *KList) Print() string {
+	l.Mu.Lock()
+	defer l.Mu.Unlock()
 
 	var sb strings.Builder
-	for e := l.l.Front(); e != nil; e = e.Next() {
+	for e := l.L.Front(); e != nil; e = e.Next() {
 		str, _ := e.Value.(string)
 		sb.WriteString("|")
 		sb.WriteString(str)
@@ -45,21 +79,21 @@ func (l *kList) Print() string {
 	return sb.String()
 }
 
-func (l *kList) PushBack(val interface{}) {
-	l.mu.Lock()
-	l.l.PushBack(val)
-	l.mu.Unlock()
+func (l *KList) PushBack(val interface{}) {
+	l.Mu.Lock()
+	l.L.PushBack(val)
+	l.Mu.Unlock()
 }
 
-func (l *kList) Size() int {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-	return l.l.Len()
+func (l *KList) Size() int {
+	l.Mu.RLock()
+	defer l.Mu.RUnlock()
+	return l.L.Len()
 }
-func (l *kList) Find(val interface{}) *list.Element {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-	for e := l.l.Front(); e != nil; e = e.Next() {
+func (l *KList) Find(val interface{}) *list.Element {
+	l.Mu.RLock()
+	defer l.Mu.RUnlock()
+	for e := l.L.Front(); e != nil; e = e.Next() {
 		if e.Value == val {
 			return e
 		}
@@ -67,54 +101,58 @@ func (l *kList) Find(val interface{}) *list.Element {
 	return nil
 }
 
-func (l *kList) Remove(val string) bool {
+func (l *KList) Remove(val string) bool {
 	e := l.Find(val)
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.Mu.Lock()
+	defer l.Mu.Unlock()
 	if e == nil {
 		return false
 	}
-	l.l.Remove(e)
+	l.L.Remove(e)
 	return true
 }
-func (l *kList) RemovePtr(e *list.Element) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+func (l *KList) RemovePtr(e *list.Element) bool {
+	l.Mu.Lock()
+	defer l.Mu.Unlock()
 	if e == nil {
 		return false
 	}
-	l.l.Remove(e)
+	l.L.Remove(e)
 	return true
 }
 
 //传入当前节点的指针和update的值
-func (l *kList) UpdateBucket(cur_node_ptr *Node, val string) bool {
-	if !cur_node_ptr.Ping(val) {
+func (l *KList) UpdateBucket(curNodePtr *Node, val string) bool {
+	//不能返回CurNode
+	if val == l.CurNode {
 		return false
 	}
-	e_ptr := l.Find(val)
-	if e_ptr != nil {
+	if !curNodePtr.Ping(val) {
+		return false
+	}
+	ePtr := l.Find(val)
+	if ePtr != nil {
 		// 该元素已经存在
-		l.mu.Lock()
-		l.l.Remove(e_ptr)
-		l.l.PushBack(val)
-		l.mu.Unlock()
+		l.Mu.Lock()
+		l.L.Remove(ePtr)
+		l.L.PushBack(val)
+		l.Mu.Unlock()
 		return true
 	} else {
 		if l.Size() < kSize {
 			l.PushBack(val)
 			return true
 		} else {
-			l.mu.RLock()
-			e_ptr = l.l.Front()
-			l.mu.RUnlock()
-			var head_node string = e_ptr.Value.(string)
-			if cur_node_ptr.Ping(head_node) {
-				l.RemovePtr(e_ptr)
-				l.PushBack(head_node)
+			l.Mu.RLock()
+			ePtr = l.L.Front()
+			l.Mu.RUnlock()
+			var headNode string = ePtr.Value.(string)
+			if curNodePtr.Ping(headNode) {
+				l.RemovePtr(ePtr)
+				l.PushBack(headNode)
 				return false
 			} else {
-				l.RemovePtr(e_ptr)
+				l.RemovePtr(ePtr)
 				l.PushBack(val)
 				return true
 			}
@@ -124,12 +162,16 @@ func (l *kList) UpdateBucket(cur_node_ptr *Node, val string) bool {
 }
 
 //按距离更新
-func (l *kList) UpdateKList(cur_node_ptr *Node, val string) bool {
-	if !cur_node_ptr.Ping(val) {
+func (l *KList) UpdateKList(curNodePtr *Node, val string) bool {
+	//不能返回CurNode
+	if val == l.CurNode {
 		return false
 	}
-	e_ptr := l.Find(val)
-	if e_ptr != nil {
+	if !curNodePtr.Ping(val) {
+		return false
+	}
+	ePtr := l.Find(val)
+	if ePtr != nil {
 		// 该元素已经存在
 		return true
 	} else {
@@ -137,29 +179,29 @@ func (l *kList) UpdateKList(cur_node_ptr *Node, val string) bool {
 			l.PushBack(val)
 			return true
 		} else {
-			//删去距离cur_node最远的节点
+			//删去距离CurNode最远的节点
 			var strValue string
-			e_ptr = nil
-			var tmp_hash *big.Int
-			target_hash := getHash(l.cur_node)
+			ePtr = nil
+			var tmpHash *big.Int
+			targetHash := getHash(l.CurNode)
 
-			l.mu.Lock()
+			l.Mu.Lock()
 			//获取距离最远的节点
-			for e := l.l.Front(); e != nil; e = e.Next() {
+			for e := l.L.Front(); e != nil; e = e.Next() {
 				strValue, _ = e.Value.(string)
-				if e_ptr == nil || closer(tmp_hash, getHash(strValue), target_hash) {
-					e_ptr = e
-					tmp_hash = getHash(strValue)
+				if ePtr == nil || closer(tmpHash, getHash(strValue), targetHash) {
+					ePtr = e
+					tmpHash = getHash(strValue)
 				}
 			}
 			//跟val比较
-			if closer(getHash(val), tmp_hash, target_hash) {
-				l.l.Remove(e_ptr)
-				l.l.PushBack(val)
-				l.mu.Unlock()
+			if closer(getHash(val), tmpHash, targetHash) {
+				l.L.Remove(ePtr)
+				l.L.PushBack(val)
+				l.Mu.Unlock()
 				return true
 			} else {
-				l.mu.Unlock()
+				l.Mu.Unlock()
 				return false
 			}
 		}
