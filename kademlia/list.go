@@ -12,6 +12,11 @@ type KListSlice struct {
 	CurNode  string
 }
 
+type KListSliceWithValue struct {
+	Klist KListSlice
+	Value string
+}
+
 func FromKListSlice(slice KListSlice) KList {
 	l := KList{
 		L:       list.New(),
@@ -36,6 +41,12 @@ func (l *KList) ToKListSlice() KListSlice {
 	return KListSlice{
 		Elements: elements,
 		CurNode:  l.CurNode,
+	}
+}
+func EmptyKListSlice() KListSlice {
+	return KListSlice{
+		Elements: make([]string, 0, 1),
+		CurNode:  "",
 	}
 }
 

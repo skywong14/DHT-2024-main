@@ -16,6 +16,8 @@ const (
 	kSize             int = 15
 	alpha             int = 3
 	RepublishInterval     = 1500 * time.Millisecond
+	NextRepublish         = 10000 * time.Second
+	NextExtinction        = 600 * time.Second
 )
 
 type DataPair struct {
@@ -30,8 +32,10 @@ type Node struct {
 	listening bool
 	online    bool // 自身是否在线
 
-	data     map[string]string
-	dataLock sync.RWMutex
+	data               map[string]string
+	dataExtinctionTime map[string]time.Time
+	dataRepublishTime  map[string]time.Time
+	dataLock           sync.RWMutex
 	//net
 	listener net.Listener
 	server   *rpc.Server
@@ -53,6 +57,8 @@ func (node *Node) Init(str_addr string) {
 	node.id = getHash(str_addr)
 
 	node.dataLock.Lock()
+	node.dataExtinctionTime = make(map[string]time.Time)
+	node.dataRepublishTime = make(map[string]time.Time)
 	node.data = make(map[string]string)
 	node.dataLock.Unlock()
 
@@ -134,16 +140,15 @@ func (node *Node) RemoteCall(addrStr string, method string, args interface{}, re
 }
 
 func (node *Node) NotifyCall(addrStr string, method string, args interface{}, reply interface{}) error {
-	logrus.Infof("[NotifyCall]")
-	err := node.RemoteCall(addrStr, method, args, reply)
-	if err != nil {
-		logrus.Errorf("[NotifyCall] [%s] calling %s [%s] occers error [%s]", node.addr, method, addrStr, err)
-		return err
-	}
-	err = node.RemoteCall(addrStr, "Node.RPCNotifyPing", node.addr, nil)
+	err := node.RemoteCall(addrStr, "Node.RPCNotifyPing", node.addr, nil)
 	if err != nil {
 		logrus.Errorf("[NotifyCall] [%s] NotifyPing [%s] occers error [%s]", node.addr, addrStr, err)
 		return err
+	}
+	err2 := node.RemoteCall(addrStr, method, args, reply)
+	if err2 != nil {
+		logrus.Errorf("[NotifyCall] [%s] calling %s [%s] occers error [%s]", node.addr, method, addrStr, err2)
+		return err2
 	}
 	return nil
 }
@@ -194,25 +199,113 @@ func (node *Node) RPCNotifyPing(caller string, _ *struct{}) error {
 
 //-----------------
 func (node *Node) PutUnit(pair DataPair, _ *struct{}) error {
-
+	node.dataLock.Lock()
+	node.data[pair.Key] = pair.Value
+	node.dataRepublishTime[pair.Key] = time.Now().Add(NextRepublish)
+	node.dataExtinctionTime[pair.Key] = time.Now().Add(NextExtinction)
+	node.dataLock.Unlock()
 	return nil
 }
-func (node *Node) Store(pair DataPair, _ *struct{}) error {
-	var strValue string
-	retList := node.Lookup(pair.Key)
-	for e := retList.L.Front(); e != nil; e = e.Next() {
-		strValue, _ = e.Value.(string)
-		node.NotifyCall(strValue, "Node.PutUnit", pair, nil)
+func (node *Node) PutMap(data map[string]string, _ *struct{}) error {
+	node.dataLock.Lock()
+	for key, val := range data {
+		node.data[key] = val
+		node.dataRepublishTime[key] = time.Now().Add(NextRepublish)
+		node.dataExtinctionTime[key] = time.Now().Add(NextExtinction)
 	}
+	node.dataLock.Unlock()
 	return nil
+}
+
+//------------------------
+//返回本地路由中距离最近的k个，或者返回value值
+func (node *Node) FindValue(target_key string, retSlice *KListSliceWithValue) error {
+	defer logrus.Infof("[FindValue] end")
+	val, ok := node.data[target_key]
+	if ok {
+		*retSlice = KListSliceWithValue{Klist: KListSlice{}, Value: val}
+		return nil
+	}
+	//否则返回list
+	var ret_list KListSlice
+	err := node.FindNode(target_key, &ret_list)
+	if err != nil {
+		logrus.Errorf("[FindValue] when FindNode with %s", target_key)
+		return err
+	}
+	*retSlice = KListSliceWithValue{Klist: ret_list, Value: ""}
+	return nil
+}
+func (node *Node) LookupValue(target_key string) string {
+	var retList KList
+	var initListWithValue, retListWithValue KListSliceWithValue
+	err := node.FindValue(target_key, &initListWithValue)
+	if err != nil {
+		logrus.Errorf("[LookupValue] %s fail", node.addr)
+		return ""
+	}
+	if initListWithValue.Value != "" {
+		return initListWithValue.Value
+	}
+	initList := FromKListSlice(initListWithValue.Klist)
+
+	logrus.Infof("[LookupValue] [%s] init_list: %s", node.addr, initList.Print())
+
+	visited := make(map[string]bool)
+	flag := true
+
+	//todo 加上并行
+	for flag {
+		var fail_nodes []string
+		flag = false
+		shortList := NewList(target_key)
+		for e := initList.L.Front(); e != nil; e = e.Next() {
+			strValue, _ := e.Value.(string)
+
+			if visited[strValue] {
+				continue
+			}
+			node.UpdateBucket(strValue)
+			visited[strValue] = true
+
+			err = node.NotifyCall(strValue, "Node.FindValue", target_key, &retListWithValue)
+
+			if err != nil {
+				logrus.Warnf("[LookupValue] [%s] fail finding [%s]", strValue, target_key)
+				fail_nodes = append(fail_nodes, strValue)
+			} else {
+				if retListWithValue.Value != "" {
+					return retListWithValue.Value
+				}
+				retList = FromKListSlice(retListWithValue.Klist)
+				logrus.Infof("[LookupValue] [%s] dealing with [%s] in list, with [%s]", node.addr, strValue, retList.Print())
+				//update shortList
+				for e_ret := retList.L.Front(); e_ret != nil; e_ret = e_ret.Next() {
+					strVal, _ := e_ret.Value.(string)
+					shortList.UpdateKList(node, strVal)
+				}
+			}
+		}
+		//delete offline nodes in initList
+		for _, val := range fail_nodes {
+			initList.Remove(val)
+			flag = true
+		}
+		//update initList by ShortList
+		for e_ret := shortList.L.Front(); e_ret != nil; e_ret = e_ret.Next() {
+			strValue, _ := e_ret.Value.(string)
+			initList.UpdateKList(node, strValue)
+		}
+	}
+	logrus.Errorf("[LookupValue end.] fail to find, final list: %s", initList.Print())
+	return ""
 }
 
 //--------------------
-// 返回离target最近的k个节点
+// 返回本地路由中离target最近的k个节点
 func (node *Node) FindNode(target_addr string, retSlice *KListSlice) error {
 	defer logrus.Infof("[FindNode] end")
 	ret := NewListPtr(target_addr)
-	// retList.Init(target_addr)
 	ind := cpl(getHash(target_addr), getHash(node.addr))
 	//现在对应的kBucket中查找
 	if ind < 0 {
@@ -280,44 +373,39 @@ func (node *Node) Lookup(target_addr string) KList {
 		for e := initList.L.Front(); e != nil; e = e.Next() {
 			strValue, _ := e.Value.(string)
 
-			logrus.Infof("[Lookup] [%s] has [%s] in list", node.addr, strValue)
-
 			if visited[strValue] {
 				continue
 			}
 			node.UpdateBucket(strValue)
 			visited[strValue] = true
 
-			// retList.Init(target_addr)
 			err = node.NotifyCall(strValue, "Node.FindNode", target_addr, &retListSlice)
-			retList = FromKListSlice(retListSlice)
 
 			if err != nil {
 				logrus.Warnf("[Lookup] [%s] fail finding [%s]", strValue, target_addr)
 				fail_nodes = append(fail_nodes, strValue)
 			} else {
+				retList = FromKListSlice(retListSlice)
+				logrus.Infof("[Lookup] [%s] dealing with [%s] in list, with [%s]", node.addr, strValue, retList.Print())
 				//update shortList
 				for e_ret := retList.L.Front(); e_ret != nil; e_ret = e_ret.Next() {
-					strValue, ok := e.Value.(string)
-					if !ok {
-						logrus.Errorf("[error] cannot convert e_ret.Value to string")
-						continue
-					}
-					shortList.UpdateKList(node, strValue)
+					strVal, _ := e_ret.Value.(string)
+					shortList.UpdateKList(node, strVal)
 				}
 			}
-			//delete offline nodes in initList
-			for _, val := range fail_nodes {
-				initList.Remove(val)
-				flag = true
-			}
-			//update initList by ShortList
-			for e_ret := retList.L.Front(); e_ret != nil; e_ret = e_ret.Next() {
-				strValue, _ := e.Value.(string)
-				initList.UpdateKList(node, strValue)
-			}
+		}
+		//delete offline nodes in initList
+		for _, val := range fail_nodes {
+			initList.Remove(val)
+			flag = true
+		}
+		//update initList by ShortList
+		for e_ret := shortList.L.Front(); e_ret != nil; e_ret = e_ret.Next() {
+			strValue, _ := e_ret.Value.(string)
+			initList.UpdateKList(node, strValue)
 		}
 	}
+	logrus.Infof("[Lookup end.] [%s] looks up [%s]", node.addr, initList.Print())
 	return initList
 }
 
@@ -327,17 +415,59 @@ func (node *Node) UpdateBucket(addr string) {
 	}
 	ind := cpl(getHash(addr), getHash(node.addr))
 	node.kBucket[ind].UpdateBucket(node, addr)
-	logrus.Infof("update kBucket, [%s]'s %d-Bucket [%s]", node.addr, ind, addr)
+	logrus.Infof("update kBucket, [%s]'s %d-Bucket [%s], adding %s", node.addr, ind, node.kBucket[ind].Print(), addr)
+}
+
+func (node *Node) Republish() {
+	republishList := make(map[string]string)
+	node.dataLock.RLock()
+	for key, t := range node.dataRepublishTime {
+		if time.Now().After(t) {
+			republishList[key] = node.data[key]
+		}
+	}
+	node.dataLock.RUnlock()
+	for key, value := range republishList {
+		node.Store(key, value)
+	}
 }
 
 func (node *Node) Maintain() {
 	go func() {
 		for node.online {
-			// node.Republish()
+			node.Republish()
 			time.Sleep(RepublishInterval)
 		}
 		logrus.Info("[end]Publish end: ", node.addr)
 	}()
+}
+
+func (node *Node) republishAll() {
+	var closeListSlice KListSlice
+	err := node.FindNode(node.addr, &closeListSlice)
+	if err != nil {
+		logrus.Errorf("[republishAll] error: %s", err)
+		return
+	}
+	closeList := FromKListSlice(closeListSlice)
+	node.dataLock.RLock()
+	var wg sync.WaitGroup
+	wg.Add(closeList.Size())
+	for e := closeList.L.Front(); e != nil; e = e.Next() {
+		strVal, _ := e.Value.(string)
+		if strVal == node.addr {
+			logrus.Errorf("[republishAll] error: same index")
+			wg.Done()
+			continue
+		}
+		go func() {
+			node.RemoteCall(strVal, "Node.PutMap", node.data, nil)
+			wg.Done()
+		}()
+	}
+	node.dataLock.RUnlock()
+	wg.Wait()
+	logrus.Infof("[republishAll] [%s] finish~", node.addr)
 }
 
 // -----------------
@@ -363,20 +493,44 @@ func (node *Node) Join(introducer string) bool {
 	return true
 }
 
+func (node *Node) Store(key string, value string) bool {
+	var strValue string
+	var err error
+	retList := node.Lookup(key)
+	logrus.Infof("Store [%s] at %s", key, retList.Print())
+	for e := retList.L.Front(); e != nil; e = e.Next() {
+		strValue, _ = e.Value.(string)
+		// logrus.Infof("[Put] [%s] %s", strValue, key)
+		err = node.NotifyCall(strValue, "Node.PutUnit", DataPair{Key: key, Value: value}, nil)
+		if err != nil {
+			logrus.Errorf("[Error] [Store] [%s] <-- (%s , %s) ", strValue, key, value)
+			return false
+		}
+	}
+	return true
+}
+
 func (node *Node) Put(key string, value string) bool {
 	logrus.Infof("存储 %s %s", key, value)
-	err := node.Store(DataPair{key, value}, nil)
-	// logrus.Infof("[Put] [%s] %s", node.Addr, key)
-	if err != nil {
-		logrus.Errorf("[Error] [Put] Put: [%s] <-- (%s , %s) ", node.addr, key, value)
-		return false
+	flag := node.Store(key, value)
+	if flag {
+		return true
 	}
-	// logrus.Infof("[Success] Put: [%s] <-- (%s , %s) ", target_addr, key, value)
-	return true
+	logrus.Errorf("[Error] [Store] (%s , %s) ", key, value)
+	return false
 }
 func (node *Node) Get(key string) (bool, string) {
 	logrus.Infof("获取 %s", key)
-	return true, ""
+	value, ok := node.data[key]
+	if ok {
+		return true, value
+	}
+	ans := node.LookupValue(key)
+	if ans == "" {
+		logrus.Errorf("[Error] [Get] fail to find [%s]", key)
+		return false, ""
+	}
+	return true, ans
 }
 
 func (node *Node) Delete(key string) bool {
@@ -386,6 +540,8 @@ func (node *Node) Delete(key string) bool {
 
 func (node *Node) Quit() {
 	logrus.Infof("退出 %s", node.addr)
+	node.republishAll()
+
 	node.turnOffNode()
 }
 func (node *Node) ForceQuit() {

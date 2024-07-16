@@ -787,7 +787,7 @@ func (node *Node) Quit() {
 	node.online = false
 	node.maintainLock.Lock()
 
-	//todo UsualQuit
+	//UsualQuit(update fingerTable)
 	var update_node, suc_node NodeAddr
 	node.GetFirstSuccessor("", &suc_node)
 	for i := 0; i < m; i++ {
