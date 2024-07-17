@@ -463,6 +463,7 @@ func (node *Node) Maintain() {
 			node.Extinction()
 			time.Sleep(ExtinctionInterval)
 		}
+		logrus.Info("[end]Extinction end: ", node.addr)
 	}()
 }
 
@@ -565,7 +566,6 @@ func (node *Node) Delete(key string) bool {
 func (node *Node) Quit() {
 	logrus.Infof("退出 %s", node.addr)
 	node.republishAll()
-
 	node.turnOffNode()
 }
 func (node *Node) ForceQuit() {
