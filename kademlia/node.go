@@ -255,7 +255,6 @@ func (node *Node) LookupValue(target_key string) string {
 	visited := make(map[string]bool)
 	flag := true
 
-	//todo 加上并行
 	for flag {
 		var fail_nodes []string
 		flag = false
@@ -366,7 +365,6 @@ func (node *Node) Lookup(target_addr string) KList {
 	visited := make(map[string]bool)
 	flag := true
 
-	//todo 加上并行
 	for flag {
 		var fail_nodes []string
 		flag = false
@@ -560,6 +558,7 @@ func (node *Node) Get(key string) (bool, string) {
 
 func (node *Node) Delete(key string) bool {
 	logrus.Infof("删除 %s", key)
+	//no need to do anything
 	return true
 }
 
