@@ -13,11 +13,12 @@ import (
 )
 
 const (
-	kSize             int = 15
-	alpha             int = 3
-	RepublishInterval     = 1500 * time.Millisecond
-	NextRepublish         = 10000 * time.Second
-	NextExtinction        = 600 * time.Second
+	kSize              int = 15
+	alpha              int = 3
+	RepublishInterval      = 1500 * time.Millisecond
+	ExtinctionInterval     = 10000 * time.Second
+	NextExtinction         = 10000 * time.Second
+	NextRepublish          = 600 * time.Second
 )
 
 type DataPair struct {
@@ -431,6 +432,23 @@ func (node *Node) Republish() {
 		node.Store(key, value)
 	}
 }
+func (node *Node) Extinction() {
+	var overdueData []string
+	node.dataLock.RLock()
+	for key, t := range node.dataExtinctionTime {
+		if time.Now().After(t) {
+			overdueData = append(overdueData, key)
+		}
+	}
+	node.dataLock.RUnlock()
+	node.dataLock.Lock()
+	for _, key := range overdueData {
+		delete(node.data, key)
+		delete(node.dataExtinctionTime, key)
+		delete(node.dataRepublishTime, key)
+	}
+	node.dataLock.Unlock()
+}
 
 func (node *Node) Maintain() {
 	go func() {
@@ -439,6 +457,12 @@ func (node *Node) Maintain() {
 			time.Sleep(RepublishInterval)
 		}
 		logrus.Info("[end]Publish end: ", node.addr)
+	}()
+	go func() {
+		for node.online {
+			node.Extinction()
+			time.Sleep(ExtinctionInterval)
+		}
 	}()
 }
 
